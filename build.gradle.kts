@@ -17,8 +17,8 @@ publishing {
 
             pom {
                 name.set("SikkerKey SDK")
-                description.set("Kotlin SDK for reading and rotating secrets from a SikkerKey vault.")
-                url.set("https://github.com/sikkerkey/sikkerkey-sdk")
+                description.set("Kotlin SDK for reading secrets from a SikkerKey vault.")
+                url.set("https://github.com/SikkerKeyOfficial/sikkerkey-kotlin")
                 licenses {
                     license {
                         name.set("MIT License")
