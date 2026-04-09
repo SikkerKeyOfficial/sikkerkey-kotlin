@@ -1,5 +1,6 @@
 # SikkerKey Kotlin/JVM SDK
 
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.sikkerkeyofficial/sikkerkey-sdk?color=green)](https://central.sonatype.com/artifact/io.github.sikkerkeyofficial/sikkerkey-sdk)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0+-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Java](https://img.shields.io/badge/Java-17+-ED8B00?logo=openjdk&logoColor=white)](https://openjdk.org)
@@ -12,7 +13,7 @@ The official Kotlin/JVM SDK for [SikkerKey](https://sikkerkey.com). Read-only ac
 
 ```kotlin
 dependencies {
-    implementation("com.sikker:sikkerkey-sdk:1.0.0")
+    implementation("io.github.sikkerkeyofficial:sikkerkey-sdk:1.0.0")
 }
 ```
 
@@ -20,7 +21,7 @@ dependencies {
 
 ```xml
 <dependency>
-    <groupId>com.sikker</groupId>
+    <groupId>io.github.sikkerkeyofficial</groupId>
     <artifactId>sikkerkey-sdk</artifactId>
     <version>1.0.0</version>
 </dependency>
