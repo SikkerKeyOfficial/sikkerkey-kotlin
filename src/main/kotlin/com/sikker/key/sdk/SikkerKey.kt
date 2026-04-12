@@ -49,8 +49,11 @@ import java.util.*
 class SikkerKey private constructor(
     private val identity: Identity,
     private val privateKey: PrivateKey,
-) {
+) : AutoCloseable {
     private val secureRandom = SecureRandom()
+    private val watchers = java.util.concurrent.ConcurrentHashMap<String, (WatchEvent) -> Unit>()
+    @Volatile private var pollThread: Thread? = null
+    @Volatile private var pollIntervalMs: Long = 15_000
 
     /** The machine ID assigned during bootstrap. */
     val machineId: String get() = identity.machineId
@@ -266,6 +269,124 @@ class SikkerKey private constructor(
         return result
     }
 
+    // ── Watch ──
+
+    /**
+     * Watch a secret for changes. When the secret is updated, rotated, deleted,
+     * or access is revoked, the callback fires with a [WatchEvent] describing
+     * what changed and the new value (if applicable).
+     *
+     * Polling starts automatically when the first watch is registered.
+     * The poll interval is 15 seconds by default (server enforces a 10-second minimum).
+     *
+     * ```kotlin
+     * sk.watch("sk_db_password") { event ->
+     *     if (event.status == WatchStatus.CHANGED) {
+     *         connectionPool.reconfigure(password = event.value!!)
+     *     }
+     * }
+     * ```
+     *
+     * @param secretId The secret ID to watch.
+     * @param callback Called on the polling thread when the secret changes.
+     */
+    fun watch(secretId: String, callback: (WatchEvent) -> Unit) {
+        watchers[secretId] = callback
+        ensurePolling()
+    }
+
+    /**
+     * Stop watching a secret. If no watches remain, polling stops automatically.
+     */
+    fun unwatch(secretId: String) {
+        watchers.remove(secretId)
+        if (watchers.isEmpty()) stopPolling()
+    }
+
+    /**
+     * Set the poll interval in seconds. Minimum 10 (enforced by the server).
+     * Default is 15 seconds.
+     */
+    fun setPollInterval(seconds: Int) {
+        pollIntervalMs = maxOf(10, seconds).toLong() * 1000
+    }
+
+    /**
+     * Stop all watches and shut down the polling thread.
+     */
+    override fun close() {
+        stopPolling()
+        watchers.clear()
+    }
+
+    private fun ensurePolling() {
+        if (pollThread?.isAlive == true) return
+        synchronized(this) {
+            if (pollThread?.isAlive == true) return
+            val thread = Thread({
+                while (watchers.isNotEmpty() && !Thread.currentThread().isInterrupted) {
+                    try {
+                        pollOnce()
+                    } catch (_: InterruptedException) {
+                        break
+                    } catch (e: Exception) {
+                        // Log but don't crash the poll loop
+                        System.err.println("SikkerKey poll error: ${e.message}")
+                    }
+                    try {
+                        Thread.sleep(pollIntervalMs)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }, "sikkerkey-poll")
+            thread.isDaemon = true
+            thread.start()
+            pollThread = thread
+        }
+    }
+
+    private fun stopPolling() {
+        pollThread?.interrupt()
+        pollThread = null
+    }
+
+    private fun pollOnce() {
+        val watchList = watchers.keys().toList()
+        if (watchList.isEmpty()) return
+
+        val payload = Json.encodeToString(PollRequestBody.serializer(), PollRequestBody(watch = watchList))
+        val responseBody = request("POST", "/v1/secrets/poll", payload)
+        val response = Json.decodeFromString<PollResponseBody>(responseBody)
+
+        for ((secretId, change) in response.changes) {
+            val callback = watchers[secretId] ?: continue
+
+            when (change.status) {
+                "changed" -> {
+                    try {
+                        val newValue = getSecret(secretId)
+                        val fields = try {
+                            val obj = Json.parseToJsonElement(newValue).jsonObject
+                            obj.entries.associate { (k, v) -> k to v.jsonPrimitive.content }
+                        } catch (_: Exception) { null }
+                        callback(WatchEvent(secretId, WatchStatus.CHANGED, newValue, fields = fields))
+                    } catch (e: Exception) {
+                        callback(WatchEvent(secretId, WatchStatus.ERROR, null, error = e.message))
+                    }
+                }
+                "deleted" -> {
+                    callback(WatchEvent(secretId, WatchStatus.DELETED, null))
+                    watchers.remove(secretId)
+                }
+                "access_denied" -> {
+                    callback(WatchEvent(secretId, WatchStatus.ACCESS_DENIED, null))
+                    watchers.remove(secretId)
+                }
+            }
+        }
+    }
+
     // ── Internal HTTP ──
 
     private val retryableCodes = setOf(429, 503)
@@ -432,6 +553,39 @@ internal data class ExportSecretEntry(val id: String, val name: String, val valu
 
 @Serializable
 internal data class ExportResponseBody(val secrets: List<ExportSecretEntry>)
+
+// ── Watch types ──
+
+/** Status of a watched secret change. */
+enum class WatchStatus {
+    /** Secret value was updated or rotated. [WatchEvent.value] contains the new value. */
+    CHANGED,
+    /** Secret was deleted. */
+    DELETED,
+    /** Machine no longer has access to this secret. */
+    ACCESS_DENIED,
+    /** Failed to fetch the updated value. [WatchEvent.error] contains the reason. */
+    ERROR,
+}
+
+/** Event delivered to a [SikkerKey.watch] callback. */
+data class WatchEvent(
+    val secretId: String,
+    val status: WatchStatus,
+    val value: String?,
+    val error: String? = null,
+    /** Parsed fields for structured secrets. Null for simple secrets or non-CHANGED events. */
+    val fields: Map<String, String>? = null,
+)
+
+@Serializable
+internal data class PollRequestBody(val watch: List<String>)
+
+@Serializable
+internal data class PollChangeBody(val status: String)
+
+@Serializable
+internal data class PollResponseBody(val changes: Map<String, PollChangeBody>)
 
 // ── Utilities ──
 

@@ -112,6 +112,59 @@ sk.export().forEach { (k, v) -> System.setProperty(k, v) }
 
 Structured secrets are flattened: `SECRET_NAME_FIELD_NAME`.
 
+## Watching for Changes
+
+Watch secrets for real-time updates. When a secret is rotated, updated, or deleted, the callback fires with the new value. Polling happens on a background daemon thread - your application is never blocked.
+
+```kotlin
+sk.watch("sk_db_password") { event ->
+    when (event.status) {
+        WatchStatus.CHANGED -> {
+            println("New value: ${event.value}")
+            // Structured secrets include parsed fields
+            println("Fields: ${event.fields}")
+        }
+        WatchStatus.DELETED -> println("Secret was deleted")
+        WatchStatus.ACCESS_DENIED -> println("Access revoked")
+        WatchStatus.ERROR -> println("Error: ${event.error}")
+    }
+}
+```
+
+### Practical Example
+
+```kotlin
+// Auto-rotate database credentials
+sk.watch("sk_db_credentials") { event ->
+    if (event.status == WatchStatus.CHANGED) {
+        Database.configureCredentials(
+            event.fields!!["username"]!!,
+            event.fields["password"]!!
+        )
+    }
+}
+```
+
+### Poll Interval
+
+The default poll interval is 15 seconds. The server enforces a minimum of 10 seconds.
+
+```kotlin
+sk.setPollInterval(30) // seconds
+```
+
+### Stop Watching
+
+```kotlin
+// Stop watching a specific secret
+sk.unwatch("sk_db_password")
+
+// Stop all watches and shut down polling
+sk.close()
+```
+
+`SikkerKey` implements `AutoCloseable`, so it can be used with Kotlin's `use` block or Java's try-with-resources.
+
 ## Multi-Vault
 
 ```kotlin
@@ -212,6 +265,10 @@ All exceptions extend `RuntimeException` (unchecked).
 | `listSecrets()` | `List<SecretListItem>` | List all accessible secrets |
 | `listSecretsByProject(projectId)` | `List<SecretListItem>` | List secrets in a project |
 | `export(projectId?)` | `Map<String, String>` | Export as env map |
+| `watch(secretId, callback)` | `Unit` | Watch a secret for changes |
+| `unwatch(secretId)` | `Unit` | Stop watching a secret |
+| `setPollInterval(seconds)` | `Unit` | Set poll interval (min 10s) |
+| `close()` | `Unit` | Stop all watches, shut down polling |
 
 ## Identity Resolution
 
