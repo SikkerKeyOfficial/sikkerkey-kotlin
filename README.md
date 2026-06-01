@@ -13,7 +13,7 @@ The official Kotlin/JVM SDK for [SikkerKey](https://sikkerkey.com). Read-only ac
 
 ```kotlin
 dependencies {
-    implementation("io.github.sikkerkeyofficial:sikkerkey-sdk:1.1.0")
+    implementation("io.github.sikkerkeyofficial:sikkerkey-sdk:1.2.0")
 }
 ```
 
@@ -23,7 +23,7 @@ dependencies {
 <dependency>
     <groupId>io.github.sikkerkeyofficial</groupId>
     <artifactId>sikkerkey-sdk</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
 </dependency>
 ```
 
