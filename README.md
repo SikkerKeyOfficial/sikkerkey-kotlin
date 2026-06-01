@@ -5,7 +5,7 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0+-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Java](https://img.shields.io/badge/Java-17+-ED8B00?logo=openjdk&logoColor=white)](https://openjdk.org)
 
-The official Kotlin/JVM SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets using Ed25519 machine authentication. Single dependency: `kotlinx-serialization-json`.
+The official Kotlin/JVM SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets using Ed25519 machine authentication. Single dependency: `kotlinx-serialization-json`. Runs on persistent hosts (identity on disk) and serverless or ephemeral environments (in-memory bootstrap).
 
 ## Installation
 
@@ -13,7 +13,7 @@ The official Kotlin/JVM SDK for [SikkerKey](https://sikkerkey.com). Read-only ac
 
 ```kotlin
 dependencies {
-    implementation("io.github.sikkerkeyofficial:sikkerkey-sdk:1.0.0")
+    implementation("io.github.sikkerkeyofficial:sikkerkey-sdk:1.1.0")
 }
 ```
 
@@ -23,7 +23,7 @@ dependencies {
 <dependency>
     <groupId>io.github.sikkerkeyofficial</groupId>
     <artifactId>sikkerkey-sdk</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
@@ -54,6 +54,46 @@ val sk = SikkerKey()
 ```
 
 Throws `ConfigurationException` if the identity is missing, the key can't be loaded, or multiple vaults exist without a specified vault ID.
+
+## Serverless (In-Memory Bootstrap)
+
+On a long-lived host the SDK loads a persistent identity from disk. Serverless and other ephemeral or read-only-filesystem environments (AWS Lambda, Google Cloud Run, Fly.io, and similar) have no identity to persist. `SikkerKey.bootstrapInMemory()` handles that case: it generates an Ed25519 keypair in memory, registers an ephemeral machine with an enrollment token, and returns a ready client. Nothing is written to disk.
+
+```kotlin
+val sk = SikkerKey.bootstrapInMemory(
+    System.getenv("SIKKERKEY_VAULT_ID"),
+    System.getenv("SIKKERKEY_ENROLLMENT_TOKEN"),
+)
+
+val dbUrl = sk.getSecret("sk_db_prod")
+```
+
+Create an enrollment token in the dashboard and supply its plaintext plus your vault ID. The token only registers an ephemeral machine scoped to the policy you set (projects, secrets, lifetime); it cannot read secrets on its own.
+
+Enrollment happens once, in the `bootstrapInMemory` call. The returned `SikkerKey` then behaves exactly like one created from disk: it signs each read with the in-memory key. The private key is gone when the process exits. The ephemeral machine lives for the lifetime set on the token; reading after it expires throws `AuthenticationException`, so size the token's machine lifetime to your workload. The common path is to read secrets at startup and hold the values.
+
+### Options
+
+```kotlin
+val sk = SikkerKey.bootstrapInMemory(
+    vaultId,
+    token,
+    hostname = "worker-1",   // defaults to $HOSTNAME, then "serverless"
+    name = "batch-runner",   // overridden if the token defines a name pattern
+)
+```
+
+### Provisioning the Token
+
+When you create the enrollment token for a serverless or ephemeral deployment:
+
+- Set a short machine lifetime (minutes). Each cold start mints a fresh ephemeral machine, and short-lived ones free their slot quickly as they expire.
+- Set max-uses high enough for your cold-start and concurrency volume.
+- Leave the source-CIDR restriction unset, since serverless egress IPs are dynamic.
+- If the vault has an IP allowlist, make sure it permits the platform's egress or leave it off.
+- Set a name pattern on the token (for example `worker-{uuid8}`) so each machine gets a unique name. A name pattern takes precedence over `name`.
+
+Each live ephemeral machine counts against your plan's machine limit until it expires.
 
 ## Reading Secrets
 
@@ -258,6 +298,7 @@ All exceptions extend `RuntimeException` (unchecked).
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `SikkerKey(vaultOrPath?)` | `SikkerKey` | Create client (companion `invoke`) |
+| `SikkerKey.bootstrapInMemory(vaultId, token, hostname?, name?)` | `SikkerKey` | Memory-only serverless bootstrap (companion) |
 | `SikkerKey.listVaults()` | `List<String>` | List registered vault IDs (companion) |
 | `getSecret(secretId)` | `String` | Read a secret value |
 | `getFields(secretId)` | `Map<String, String>` | Read structured secret |

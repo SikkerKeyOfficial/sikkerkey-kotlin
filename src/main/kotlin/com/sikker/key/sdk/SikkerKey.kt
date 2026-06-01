@@ -11,6 +11,7 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
 import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.SecureRandom
@@ -81,6 +82,70 @@ class SikkerKey private constructor(
         operator fun invoke(vaultOrPath: String? = null): SikkerKey {
             val identityFile = resolveIdentity(vaultOrPath)
             return loadFromFile(identityFile)
+        }
+
+        private const val DEFAULT_API_URL = "https://api.sikkerkey.com"
+
+        /**
+         * Bootstrap a memory-only ephemeral identity for serverless / read-only
+         * filesystem environments that have no identity on disk.
+         *
+         * Generates an Ed25519 keypair in memory, registers an ephemeral machine
+         * with the enrollment token, and returns a client whose identity lives
+         * only in process memory; nothing is written to disk. Enrollment happens
+         * once, here; the returned client then behaves exactly like a disk-based
+         * client. The ephemeral machine lives for the lifetime set on the token;
+         * reading after it expires throws [AuthenticationException], so size the
+         * token's machine lifetime to the workload. The common path is to read
+         * secrets at startup and hold the values.
+         *
+         * @param vaultId  The vault ID (`vault_...`).
+         * @param token    The plaintext of an enrollment token.
+         * @param hostname Hostname recorded on the machine. Defaults to `$HOSTNAME`, then `serverless`.
+         *                 Must match the token's hostname pattern if one is set.
+         * @param name     Optional machine name. Overridden when the token defines a name pattern.
+         */
+        fun bootstrapInMemory(
+            vaultId: String,
+            token: String,
+            hostname: String? = null,
+            name: String? = null,
+        ): SikkerKey {
+            if (vaultId.isBlank()) throw ConfigurationException("bootstrapInMemory requires a vault ID")
+            if (token.isBlank()) throw ConfigurationException("bootstrapInMemory requires an enrollment token")
+
+            // SikkerKey is a managed service; the API URL is fixed. The env override is for local dev only.
+            val rawUrl = System.getenv("SIKKERKEY_API_URL") ?: DEFAULT_API_URL
+            if (!rawUrl.startsWith("https://") && !rawUrl.startsWith("http://localhost")) {
+                throw ConfigurationException("API URL must use HTTPS: $rawUrl. Use http://localhost only for local development.")
+            }
+            val apiUrl = rawUrl.trimEnd('/')
+
+            // Generate the keypair in memory. The private key never leaves this process.
+            val keyPair = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+            // X.509 SubjectPublicKeyInfo for Ed25519 is a 12-byte header + the raw 32-byte key.
+            val encoded = keyPair.public.encoded
+            val rawPub = encoded.copyOfRange(encoded.size - 32, encoded.size)
+            // Server expects the raw 32-byte public key as standard base64 (44 chars).
+            val publicKeyB64 = Base64.getEncoder().encodeToString(rawPub)
+
+            val host = hostname ?: System.getenv("HOSTNAME") ?: "serverless"
+            val payload = Json.encodeToString(JsonObject.serializer(), buildJsonObject {
+                put("token", JsonPrimitive(token))
+                put("publicKey", JsonPrimitive(publicKeyB64))
+                put("hostname", JsonPrimitive(host))
+                if (name != null) put("name", JsonPrimitive(name))
+            })
+
+            val resp = enrollRegister(apiUrl, vaultId, payload)
+            val identity = Identity(
+                machineId = resp.machineId,
+                machineName = resp.machineName,
+                vaultId = resp.vaultId,
+                apiUrl = apiUrl,
+                privateKeyPath = "",
+            )
+            return SikkerKey(identity, keyPair.private)
         }
 
         private fun resolveIdentity(vaultOrPath: String?): File {
@@ -165,6 +230,53 @@ class SikkerKey private constructor(
             val bytes = Base64.getDecoder().decode(base64)
             val keySpec = PKCS8EncodedKeySpec(bytes)
             return KeyFactory.getInstance("Ed25519").generatePrivate(keySpec)
+        }
+
+        private fun enrollRegister(apiUrl: String, vaultId: String, body: String): EnrollResponse {
+            val url = URI("$apiUrl/v1/$vaultId/enroll/register").toURL()
+            val conn = url.openConnection() as HttpURLConnection
+            try {
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.connectTimeout = 15_000
+                conn.readTimeout = 15_000
+                conn.doOutput = true
+                conn.outputStream.use { it.write(body.toByteArray()) }
+
+                val code: Int
+                val responseBody: String
+                try {
+                    code = conn.responseCode
+                    responseBody = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                        ?.use { it.bufferedReader().readText() } ?: ""
+                } catch (e: java.io.IOException) {
+                    throw ApiException("Enrollment network error: ${e.message}", 0)
+                }
+
+                if (code in 200..299) {
+                    val resp = Json.decodeFromString<EnrollResponse>(responseBody)
+                    if (resp.machineId.isBlank() || resp.vaultId.isBlank()) {
+                        throw ApiException("Malformed enrollment response", code)
+                    }
+                    return resp
+                }
+
+                val error = try {
+                    Json.decodeFromString<ErrorBody>(responseBody).error
+                } catch (_: Exception) { responseBody.ifBlank { "HTTP $code" } }
+
+                throw when (code) {
+                    401 -> AuthenticationException(error)
+                    403 -> AccessDeniedException(error)
+                    404 -> NotFoundException(error)
+                    409 -> ConflictException(error)
+                    429 -> RateLimitedException(error)
+                    503 -> ServerSealedException(error)
+                    else -> ApiException(error, code)
+                }
+            } finally {
+                conn.disconnect()
+            }
         }
     }
 
@@ -553,6 +665,14 @@ internal data class ExportSecretEntry(val id: String, val name: String, val valu
 
 @Serializable
 internal data class ExportResponseBody(val secrets: List<ExportSecretEntry>)
+
+@Serializable
+internal data class EnrollResponse(
+    val machineId: String,
+    val machineName: String = "",
+    val vaultId: String,
+    val expiresAt: Long = 0,
+)
 
 // ── Watch types ──
 
