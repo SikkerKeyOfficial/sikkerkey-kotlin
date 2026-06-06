@@ -142,7 +142,10 @@ class SikkerKey private constructor(
                 machineId = resp.machineId,
                 machineName = resp.machineName,
                 vaultId = resp.vaultId,
-                apiUrl = apiUrl,
+                // Enrollment ran against the backend (apiUrl); runtime reads go to
+                // the retrieval plane the backend hands back. Fall back to the
+                // enroll URL only if an older endpoint omits it.
+                apiUrl = resp.apiUrl.ifBlank { apiUrl },
                 privateKeyPath = "",
             )
             return SikkerKey(identity, keyPair.private)
@@ -672,6 +675,8 @@ internal data class EnrollResponse(
     val machineName: String = "",
     val vaultId: String,
     val expiresAt: Long = 0,
+    /** Retrieval-plane base URL (the machine-service); stored as the identity's read URL. */
+    val apiUrl: String = "",
 )
 
 // ── Watch types ──

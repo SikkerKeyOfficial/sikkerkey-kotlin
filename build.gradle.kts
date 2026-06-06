@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "io.github.sikkerkeyofficial"
-version = "1.2.0"
+version = "1.2.1"
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
