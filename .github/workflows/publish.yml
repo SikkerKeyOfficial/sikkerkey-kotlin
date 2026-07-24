@@ -28,12 +28,17 @@ jobs:
           sk = SikkerKey.bootstrap_in_memory(
               os.environ["SIKKERKEY_VAULT_ID"], os.environ["SIKKERKEY_ENROLLMENT_TOKEN"])
           f = sk.get_fields(os.environ["SECRET_ID"])
+          key = base64.b64decode(f["signingInMemoryKey"]).decode()
+          # Register every fetched credential as a GitHub log mask (defense in depth).
+          for v in (f["mavenCentralUsername"], f["mavenCentralPassword"],
+                    f["signingInMemoryKeyPassword"], f["signingInMemoryKey"], key):
+              print(f"::add-mask::{v}")
           env = {
               **os.environ,
               "ORG_GRADLE_PROJECT_mavenCentralUsername": f["mavenCentralUsername"],
               "ORG_GRADLE_PROJECT_mavenCentralPassword": f["mavenCentralPassword"],
               "ORG_GRADLE_PROJECT_signingInMemoryKeyPassword": f["signingInMemoryKeyPassword"],
-              "ORG_GRADLE_PROJECT_signingInMemoryKey": base64.b64decode(f["signingInMemoryKey"]).decode(),
+              "ORG_GRADLE_PROJECT_signingInMemoryKey": key,
           }
           subprocess.run(
               ["./gradlew", "publishAndReleaseToMavenCentral", "--no-configuration-cache"],
