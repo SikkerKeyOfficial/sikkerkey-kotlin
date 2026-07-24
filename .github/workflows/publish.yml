@@ -29,9 +29,13 @@ jobs:
               os.environ["SIKKERKEY_VAULT_ID"], os.environ["SIKKERKEY_ENROLLMENT_TOKEN"])
           f = sk.get_fields(os.environ["SECRET_ID"])
           key = base64.b64decode(f["signingInMemoryKey"]).decode()
-          # Register every fetched credential as a GitHub log mask (defense in depth).
-          for v in (f["mavenCentralUsername"], f["mavenCentralPassword"],
-                    f["signingInMemoryKeyPassword"], f["signingInMemoryKey"], key):
+          # ::add-mask:: is per line: mask single-line values directly, and the multi-line
+          # key one line at a time. A multi-line mask would print every line after the
+          # first straight into the log.
+          masks = [f["mavenCentralUsername"], f["mavenCentralPassword"],
+                   f["signingInMemoryKeyPassword"], f["signingInMemoryKey"]]
+          masks += [ln for ln in key.splitlines() if ln.strip()]
+          for v in masks:
               print(f"::add-mask::{v}")
           env = {
               **os.environ,
