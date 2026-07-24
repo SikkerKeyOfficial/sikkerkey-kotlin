@@ -5,15 +5,34 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0+-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Java](https://img.shields.io/badge/Java-17+-ED8B00?logo=openjdk&logoColor=white)](https://openjdk.org)
 
-The official Kotlin/JVM SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets using Ed25519 machine authentication. Single dependency: `kotlinx-serialization-json`. Runs on persistent hosts (identity on disk) and serverless or ephemeral environments (in-memory bootstrap).
+Use the official SikkerKey Kotlin/JVM SDK to give a Kotlin or Java application read access to the secrets its machine is authorized to use.
 
-## Installation
+The SDK can:
+
+- Read standard and structured secrets.
+- List the secrets available to a machine.
+- Export accessible secrets as application-friendly key/value pairs.
+- Monitor selected secrets for changes.
+- Use persistent machine identities or memory-only ephemeral identities.
+- Keep an optional encrypted fallback cache for temporary service or network outages.
+
+After the client is initialized, every secret request is authenticated with the machine's Ed25519 identity. The SDK is synchronous, uses the Java 17 networking and cryptography APIs, and has one direct runtime dependency: `kotlinx-serialization-json`.
+
+## Requirements
+
+- Java 17 or newer.
+- A SikkerKey vault.
+- A machine identity with access to the secrets your application needs.
+
+Persistent applications use an identity provisioned on the host. Serverless jobs and other short-lived workloads can enroll an ephemeral machine in memory with an enrollment token.
+
+## Install the SDK
 
 ### Gradle
 
 ```kotlin
 dependencies {
-    implementation("io.github.sikkerkeyofficial:sikkerkey-sdk:1.2.1")
+    implementation("io.github.sikkerkeyofficial:sikkerkey-sdk:1.3.0")
 }
 ```
 
@@ -23,328 +42,455 @@ dependencies {
 <dependency>
     <groupId>io.github.sikkerkeyofficial</groupId>
     <artifactId>sikkerkey-sdk</artifactId>
-    <version>1.2.1</version>
+    <version>1.3.0</version>
 </dependency>
 ```
 
-Requires Java 17+.
+## Read your first secret
 
-## Quick Start
+Create a client for your vault and pass a secret ID to `getSecret`:
 
 ```kotlin
 import com.sikker.key.sdk.SikkerKey
 
-val sk = SikkerKey("vault_abc123")
-val apiKey = sk.getSecret("sk_stripe_key")
+val sikkerKey = SikkerKey("vault_abc123")
+val apiKey = sikkerKey.getSecret("sk_stripe_key")
 ```
 
-The SDK reads the machine identity from `~/.sikkerkey/vaults/<vault-id>/identity.json`, signs every request with the machine's Ed25519 private key, and returns the decrypted value. All methods are synchronous (blocking).
+The SDK loads the machine identity from:
 
-## Client Creation
-
-```kotlin
-// Explicit vault ID
-val sk = SikkerKey("vault_abc123")
-
-// Direct path to identity file
-val sk = SikkerKey("/etc/sikkerkey/vaults/vault_abc123/identity.json")
-
-// Auto-detect from SIKKERKEY_IDENTITY env or single vault on disk
-val sk = SikkerKey()
+```text
+~/.sikkerkey/vaults/vault_abc123/identity.json
 ```
 
-Throws `ConfigurationException` if the identity is missing, the key can't be loaded, or multiple vaults exist without a specified vault ID.
+It signs the request with the machine's Ed25519 private key and returns the secret value as a `String`. Your application's access remains limited by the machine's configured access.
 
-## Serverless (In-Memory Bootstrap)
+All SDK methods are synchronous. Run network calls on an appropriate worker or I/O dispatcher when calling them from asynchronous application code.
 
-On a long-lived host the SDK loads a persistent identity from disk. Serverless and other ephemeral or read-only-filesystem environments (AWS Lambda, Google Cloud Run, Fly.io, and similar) have no identity to persist. `SikkerKey.bootstrapInMemory()` handles that case: it generates an Ed25519 keypair in memory, registers an ephemeral machine with an enrollment token, and returns a ready client. Nothing is written to disk.
+## Create a client
+
+Choose the form that fits how identities are installed in your environment:
 
 ```kotlin
-val sk = SikkerKey.bootstrapInMemory(
-    System.getenv("SIKKERKEY_VAULT_ID"),
-    System.getenv("SIKKERKEY_ENROLLMENT_TOKEN"),
+// Select a registered vault.
+val byVault = SikkerKey("vault_abc123")
+
+// Load a specific identity file.
+val byPath = SikkerKey("/etc/sikkerkey/vaults/vault_abc123/identity.json")
+
+// Use SIKKERKEY_IDENTITY or auto-select the only registered vault.
+val automatically = SikkerKey()
+```
+
+When no argument is supplied, the SDK checks `SIKKERKEY_IDENTITY` first. If that variable is not set, it uses the only registered vault under `~/.sikkerkey/vaults/`.
+
+If more than one vault is registered, select a vault explicitly. Missing identities, unreadable keys, invalid identity files, and ambiguous vault selection produce a `ConfigurationException`.
+
+The `vault_` prefix is added when a vault ID is supplied without it.
+
+### Use a different identity directory
+
+Set `SIKKERKEY_HOME` to move the SDK's base directory:
+
+```bash
+export SIKKERKEY_HOME=/var/lib/sikkerkey
+```
+
+The SDK will look for identities under:
+
+```text
+/var/lib/sikkerkey/vaults/<vault-id>/identity.json
+```
+
+## Use an ephemeral identity
+
+`bootstrapInMemory` is designed for short-lived or read-only environments where an identity should not be stored on disk.
+
+```kotlin
+val sikkerKey = SikkerKey.bootstrapInMemory(
+    vaultId = System.getenv("SIKKERKEY_VAULT_ID"),
+    token = System.getenv("SIKKERKEY_ENROLLMENT_TOKEN"),
 )
 
-val dbUrl = sk.getSecret("sk_db_prod")
+val databaseUrl = sikkerKey.getSecret("sk_db_prod")
 ```
 
-Create an enrollment token in the dashboard and supply its plaintext plus your vault ID. The token only registers an ephemeral machine scoped to the policy you set (projects, secrets, lifetime); it cannot read secrets on its own.
+During bootstrap, the SDK:
 
-Enrollment happens once, in the `bootstrapInMemory` call. The returned `SikkerKey` then behaves exactly like one created from disk: it signs each read with the in-memory key. The private key is gone when the process exits. The ephemeral machine lives for the lifetime set on the token; reading after it expires throws `AuthenticationException`, so size the token's machine lifetime to your workload. The common path is to read secrets at startup and hold the values.
+1. Generates an Ed25519 key pair in memory.
+2. Uses the enrollment token to register an ephemeral machine.
+3. Keeps the private key inside the running process.
+4. Returns a client ready to read the secrets allowed by the token's access policy.
 
-### Options
+Nothing is written to disk by `bootstrapInMemory`. The private key disappears when the process exits.
+
+The enrollment token registers the machine; it does not read secrets itself. The resulting machine remains subject to the token's permitted scope, use limit, hostname rules, and machine lifetime. Once the machine expires, subsequent reads produce an `AuthenticationException`.
+
+### Set the machine hostname and name
 
 ```kotlin
-val sk = SikkerKey.bootstrapInMemory(
-    vaultId,
-    token,
-    hostname = "worker-1",   // defaults to $HOSTNAME, then "serverless"
-    name = "batch-runner",   // overridden if the token defines a name pattern
+val sikkerKey = SikkerKey.bootstrapInMemory(
+    vaultId = vaultId,
+    token = enrollmentToken,
+    hostname = "worker-1",
+    name = "invoice-runner",
 )
 ```
 
-### Provisioning the Token
+`hostname` defaults to the `HOSTNAME` environment variable and then to `serverless`. A name pattern configured on the enrollment token takes precedence over the `name` argument.
 
-When you create the enrollment token for a serverless or ephemeral deployment:
+For reliable ephemeral deployments:
 
-- Set a short machine lifetime (minutes). Each cold start mints a fresh ephemeral machine, and short-lived ones free their slot quickly as they expire.
-- Set max-uses high enough for your cold-start and concurrency volume.
-- Leave the source-CIDR restriction unset, since serverless egress IPs are dynamic.
-- If the vault has an IP allowlist, make sure it permits the platform's egress or leave it off.
-- Set a name pattern on the token (for example `worker-{uuid8}`) so each machine gets a unique name. A name pattern takes precedence over `name`.
+- Set a machine lifetime long enough for the workload to finish.
+- Allow enough token uses for expected cold starts and concurrency.
+- Use a unique name pattern such as `worker-{uuid8}`.
+- Ensure the vault's IP allowlist permits the workload's outbound address when an allowlist is enabled.
 
-Each live ephemeral machine counts against your plan's machine limit until it expires.
+Each active ephemeral machine uses a machine slot until it expires.
 
-## Reading Secrets
+## Read secrets
 
-### Single Value
+### Standard secrets
+
+Use `getSecret` when you need the complete value:
 
 ```kotlin
-val apiKey = sk.getSecret("sk_stripe_prod")
+val apiKey: String = sikkerKey.getSecret("sk_stripe_prod")
 ```
 
-### Structured (Multiple Fields)
+### Structured secrets
+
+Use `getFields` to read a structured secret as field names and values:
 
 ```kotlin
-val fields = sk.getFields("sk_db_prod")
-val host = fields["host"]       // "db.example.com"
-val password = fields["password"] // "hunter2"
+val database = sikkerKey.getFields("sk_db_prod")
+
+val host = database["host"]
+val username = database["username"]
+val password = database["password"]
 ```
 
-Throws `SecretStructureException` if the secret value is not a JSON object.
+`getFields` expects the stored value to be a JSON object with scalar field values. It throws `SecretStructureException` when the value cannot be read as that structure.
 
-### Single Field
+Use `getField` when your application needs one field:
 
 ```kotlin
-val password = sk.getField("sk_db_prod", "password")
+val password = sikkerKey.getField("sk_db_prod", "password")
 ```
 
-Throws `FieldNotFoundException` if the field doesn't exist. The error message includes available field names.
+If the field is missing, `FieldNotFoundException` includes the available field names.
 
-## Listing Secrets
+## Discover accessible secrets
+
+`listSecrets` returns metadata for every secret the machine can access:
 
 ```kotlin
-// All secrets this machine can access
-val secrets = sk.listSecrets()
-for (s in secrets) {
-    println("${s.id}: ${s.name}")
+val secrets = sikkerKey.listSecrets()
+
+for (secret in secrets) {
+    println("${secret.id}: ${secret.name}")
 }
-
-// Secrets in a specific project
-val projectSecrets = sk.listSecretsByProject("proj_production")
 ```
 
-Returns `List<SecretListItem>` with `id`, `name`, `fieldNames` (nullable), and `projectId` (nullable).
-
-## Export
+Use `listSecretsByProject` to limit the result to one project:
 
 ```kotlin
-// All secrets as a flat map
-val env = sk.export()
-// {API_KEY=sk-live-..., DB_CREDS_HOST=db.example.com, DB_CREDS_PASSWORD=s3cret}
-
-// Scoped to a project
-val env = sk.export("proj_production")
-
-// Inject into system properties
-sk.export().forEach { (k, v) -> System.setProperty(k, v) }
+val productionSecrets =
+    sikkerKey.listSecretsByProject("proj_production")
 ```
 
-Structured secrets are flattened: `SECRET_NAME_FIELD_NAME`.
+Each `SecretListItem` contains:
 
-## Watching for Changes
+| Property | Type | Meaning |
+|---|---|---|
+| `id` | `String` | Secret ID used by read methods |
+| `name` | `String` | Display name |
+| `fieldNames` | `String?` | Optional structured-field metadata |
+| `projectId` | `String?` | Owning project, when present |
 
-Watch secrets for real-time updates. When a secret is rotated, updated, or deleted, the callback fires with the new value. Polling happens on a background daemon thread - your application is never blocked.
+Listing returns metadata, not secret values.
+
+## Export secrets for application configuration
+
+`export` retrieves accessible values in one request and returns a flat `Map<String, String>`:
 
 ```kotlin
-sk.watch("sk_db_password") { event ->
+val configuration = sikkerKey.export()
+
+configuration.forEach { (name, value) ->
+    System.setProperty(name, value)
+}
+```
+
+Limit the export to a project when the application only needs that scope:
+
+```kotlin
+val productionConfiguration =
+    sikkerKey.export("proj_production")
+```
+
+Names are converted to uppercase environment-style keys. Unsupported characters become underscores. Structured secrets are expanded into one entry per field:
+
+```text
+API_KEY
+DB_CREDENTIALS_HOST
+DB_CREDENTIALS_USERNAME
+DB_CREDENTIALS_PASSWORD
+```
+
+## Continue reads during temporary outages
+
+The fallback cache is disabled by default. Enable it for persistent hosts that should continue using a recently retrieved value when SikkerKey or the network is temporarily unreachable:
+
+```kotlin
+val sikkerKey = SikkerKey("vault_abc123")
+    .enableCache()
+```
+
+After the cache is enabled, each successful `getSecret` read stores an encrypted entry under:
+
+```text
+~/.sikkerkey/vaults/<vault-id>/cache/
+```
+
+`getFields` and `getField` use `getSecret`, so their successful reads are cached as well.
+
+The SDK can return a cached value after:
+
+- A network connection failure.
+- HTTP `502`, `503`, or `504`.
+- Cloudflare origin-connectivity responses `520` through `527`, or `530`.
+
+An authoritative response is never replaced by a cached value. Authentication failures, revoked access, missing secrets, rate limits, and other application responses continue to reach your code normally.
+
+Cache files use AES-256-GCM with a key derived from the machine's Ed25519 identity and vault ID. A file cannot be decrypted without the matching machine identity, and tampered entries are rejected.
+
+### Limit cache age
+
+Set `maxAge` to the maximum age, in seconds, that your application accepts during an outage:
+
+```kotlin
+val sikkerKey = SikkerKey("vault_abc123").enableCache(
+    maxAge = 3600,
+)
+```
+
+Without `maxAge`, cached values do not expire automatically. They are still only read when the live service cannot be reached.
+
+### Observe fallback use
+
+Use `onFallback` to record when the SDK serves a cached value:
+
+```kotlin
+val sikkerKey = SikkerKey("vault_abc123").enableCache(
+    maxAge = 3600,
+    onFallback = { secretId, cachedAt ->
+        println("Used cached value for $secretId from epoch $cachedAt")
+    },
+)
+```
+
+The SDK does not emit a cache-fallback message unless you supply this callback.
+
+The fallback cache is intended for a host with a persistent, protected identity directory. It is not useful for a memory-only identity that disappears when the process exits.
+
+## Monitor secrets for changes
+
+Use `watch` when your application should react after a secret changes, is deleted, or becomes inaccessible:
+
+```kotlin
+import com.sikker.key.sdk.WatchStatus
+
+sikkerKey.watch("sk_db_credentials") { event ->
     when (event.status) {
         WatchStatus.CHANGED -> {
-            println("New value: ${event.value}")
-            // Structured secrets include parsed fields
-            println("Fields: ${event.fields}")
+            val username = event.fields?.get("username")
+            val password = event.fields?.get("password")
+            println("Database credentials changed for ${event.secretId}")
         }
-        WatchStatus.DELETED -> println("Secret was deleted")
-        WatchStatus.ACCESS_DENIED -> println("Access revoked")
-        WatchStatus.ERROR -> println("Error: ${event.error}")
+
+        WatchStatus.DELETED ->
+            println("${event.secretId} was deleted")
+
+        WatchStatus.ACCESS_DENIED ->
+            println("Access to ${event.secretId} was removed")
+
+        WatchStatus.ERROR ->
+            println("Could not retrieve the update: ${event.error}")
     }
 }
 ```
 
-### Practical Example
+The SDK polls on a background daemon thread every 15 seconds by default. Your callback also runs on that polling thread, so hand off slow or blocking work to your application's executor.
+
+For `CHANGED` events:
+
+- `event.value` contains the new complete value.
+- `event.fields` contains parsed fields when the value is a structured JSON object.
+
+Deleted and inaccessible secrets are automatically removed from the watch list.
+
+### Change the polling interval
 
 ```kotlin
-// Auto-rotate database credentials
-sk.watch("sk_db_credentials") { event ->
-    if (event.status == WatchStatus.CHANGED) {
-        Database.configureCredentials(
-            event.fields!!["username"]!!,
-            event.fields["password"]!!
-        )
-    }
+sikkerKey.setPollInterval(30)
+```
+
+The value is in seconds. Values below 10 are raised to 10 seconds.
+
+### Stop monitoring
+
+```kotlin
+// Stop one watch.
+sikkerKey.unwatch("sk_db_credentials")
+
+// Stop all watches and shut down the polling thread.
+sikkerKey.close()
+```
+
+`SikkerKey` implements `AutoCloseable`, so you can scope it with `use`:
+
+```kotlin
+SikkerKey("vault_abc123").use { sikkerKey ->
+    val password = sikkerKey.getField("sk_db_credentials", "password")
+    startApplication(password)
 }
 ```
 
-### Poll Interval
+## Work with more than one vault
 
-The default poll interval is 15 seconds. The server enforces a minimum of 10 seconds.
-
-```kotlin
-sk.setPollInterval(30) // seconds
-```
-
-### Stop Watching
+Create one client per vault:
 
 ```kotlin
-// Stop watching a specific secret
-sk.unwatch("sk_db_password")
+val production = SikkerKey("vault_production")
+val staging = SikkerKey("vault_staging")
 
-// Stop all watches and shut down polling
-sk.close()
-```
-
-`SikkerKey` implements `AutoCloseable`, so it can be used with Kotlin's `use` block or Java's try-with-resources.
-
-## Multi-Vault
-
-```kotlin
-val prod = SikkerKey("vault_a1b2c3")
-val staging = SikkerKey("vault_x9y8z7")
-
-val prodKey = prod.getSecret("sk_api_key")
+val productionKey = production.getSecret("sk_api_key")
 val stagingKey = staging.getSecret("sk_api_key")
 ```
 
-### List Registered Vaults
+List the vault identities registered under `SIKKERKEY_HOME`:
 
 ```kotlin
-val vaults = SikkerKey.listVaults()
-// ["vault_a1b2c3", "vault_x9y8z7"]
+val vaultIds: List<String> = SikkerKey.listVaults()
 ```
 
-Companion object function.
+## Inspect the active machine
 
-## Java Interop
-
-The SDK works from Java with no additional configuration:
-
-```java
-import com.sikker.key.sdk.SikkerKey;
-
-var sk = SikkerKey.Companion.invoke("vault_abc123");
-var secret = sk.getSecret("sk_stripe_key");
-
-var fields = sk.getFields("sk_db_prod");
-var host = fields.get("host");
-```
-
-## Machine Info
+The client exposes the identity it is using:
 
 ```kotlin
-sk.machineId    // "550e8400-e29b-41d4-a716-446655440000"
-sk.machineName  // "api-server-1"
-sk.vaultId      // "vault_abc123"
-sk.apiUrl       // "https://api.sikkerkey.com"
+println(sikkerKey.machineId)
+println(sikkerKey.machineName)
+println(sikkerKey.vaultId)
+println(sikkerKey.apiUrl)
 ```
 
-## Error Handling
+| Property | Meaning |
+|---|---|
+| `machineId` | Machine UUID assigned by SikkerKey |
+| `machineName` | Machine name assigned during provisioning or enrollment |
+| `vaultId` | Vault associated with the machine identity |
+| `apiUrl` | Retrieval endpoint stored in the identity |
+
+## Handle errors
+
+The SDK's exception hierarchy starts with the unchecked `SikkerKeyException` type:
 
 ```kotlin
 import com.sikker.key.sdk.*
 
 try {
-    val secret = sk.getSecret("sk_nonexistent")
-} catch (e: NotFoundException) {
-    // 404 - secret doesn't exist
-} catch (e: AccessDeniedException) {
-    // 403 - machine not approved or no grant
-} catch (e: AuthenticationException) {
-    // 401 - invalid signature or unknown machine
-} catch (e: ApiException) {
-    // any other HTTP error
-    println(e.httpStatus)
+    val value = sikkerKey.getSecret("sk_example")
+} catch (error: NotFoundException) {
+    // The requested secret or resource was not found.
+} catch (error: AccessDeniedException) {
+    // The machine is not allowed to perform this read.
+} catch (error: AuthenticationException) {
+    // The machine identity could not be authenticated.
+} catch (error: RateLimitedException) {
+    // The request remained rate-limited after automatic retries.
+} catch (error: ApiException) {
+    println("SikkerKey returned HTTP ${error.httpStatus}: ${error.message}")
+} catch (error: ConfigurationException) {
+    println("The machine identity could not be loaded: ${error.message}")
 }
 ```
 
-### Exception Hierarchy
+### Exception reference
 
+| Exception | When it is used |
+|---|---|
+| `ConfigurationException` | Identity, key, vault-selection, or bootstrap configuration is invalid |
+| `AuthenticationException` | HTTP `401` |
+| `AccessDeniedException` | HTTP `403` |
+| `NotFoundException` | HTTP `404` |
+| `ConflictException` | HTTP `409` |
+| `RateLimitedException` | HTTP `429` |
+| `ServerSealedException` | HTTP `503` |
+| `ApiException` | Another HTTP or network error; inspect `httpStatus` |
+| `SecretStructureException` | `getFields` or `getField` received a non-structured value |
+| `FieldNotFoundException` | The requested structured field does not exist |
+
+Network failures use an `ApiException` with `httpStatus == 0`.
+
+### Retries and timeouts
+
+The SDK automatically retries network failures and HTTP `429` or `503` responses up to three times. Retries wait 1, 2, and 4 seconds, and every attempt receives a fresh timestamp and nonce.
+
+Connections and responses each use a 15-second timeout. Other HTTP responses are returned immediately as their matching exception.
+
+## Use the SDK from Java
+
+The Kotlin companion methods are available through `SikkerKey.Companion`:
+
+```java
+import com.sikker.key.sdk.SikkerKey;
+
+var sikkerKey = SikkerKey.Companion.invoke("vault_abc123");
+var apiKey = sikkerKey.getSecret("sk_stripe_key");
+
+var database = sikkerKey.getFields("sk_db_prod");
+var host = database.get("host");
 ```
-SikkerKeyException (extends RuntimeException)
-├── ConfigurationException      - identity/key issues
-├── SecretStructureException    - secret is not a JSON object (getFields)
-├── FieldNotFoundException      - field not in structured secret (getField)
-└── ApiException                - HTTP error (has httpStatus property)
-    ├── AuthenticationException - 401
-    ├── AccessDeniedException   - 403
-    ├── NotFoundException       - 404
-    ├── ConflictException       - 409
-    ├── RateLimitedException    - 429
-    └── ServerSealedException   - 503
-```
 
-All exceptions extend `RuntimeException` (unchecked).
+## Feature-to-API reference
 
-## Properties
+| What you want to do | SDK API | Result |
+|---|---|---|
+| Create a client from disk | `SikkerKey(vaultOrPath?)` | `SikkerKey` |
+| Create a memory-only ephemeral client | `SikkerKey.bootstrapInMemory(vaultId, token, hostname?, name?)` | `SikkerKey` |
+| List locally registered vaults | `SikkerKey.listVaults()` | `List<String>` |
+| Enable outage fallback | `enableCache(maxAge?, onFallback?)` | The same `SikkerKey` client |
+| Read a standard secret | `getSecret(secretId)` | `String` |
+| Read every structured field | `getFields(secretId)` | `Map<String, String>` |
+| Read one structured field | `getField(secretId, field)` | `String` |
+| List accessible secrets | `listSecrets()` | `List<SecretListItem>` |
+| List accessible secrets in a project | `listSecretsByProject(projectId)` | `List<SecretListItem>` |
+| Export accessible values | `export(projectId?)` | `Map<String, String>` |
+| Monitor a secret | `watch(secretId, callback)` | `Unit` |
+| Stop monitoring one secret | `unwatch(secretId)` | `Unit` |
+| Set the polling interval | `setPollInterval(seconds)` | `Unit` |
+| Stop all monitoring | `close()` | `Unit` |
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `machineId` | `String` | Machine UUID |
-| `machineName` | `String` | Hostname from bootstrap |
-| `vaultId` | `String` | Vault this identity belongs to |
-| `apiUrl` | `String` | SikkerKey API URL |
+## Runtime footprint
 
-## Method Reference
+The SDK uses:
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `SikkerKey(vaultOrPath?)` | `SikkerKey` | Create client (companion `invoke`) |
-| `SikkerKey.bootstrapInMemory(vaultId, token, hostname?, name?)` | `SikkerKey` | Memory-only serverless bootstrap (companion) |
-| `SikkerKey.listVaults()` | `List<String>` | List registered vault IDs (companion) |
-| `getSecret(secretId)` | `String` | Read a secret value |
-| `getFields(secretId)` | `Map<String, String>` | Read structured secret |
-| `getField(secretId, field)` | `String` | Read single field |
-| `listSecrets()` | `List<SecretListItem>` | List all accessible secrets |
-| `listSecretsByProject(projectId)` | `List<SecretListItem>` | List secrets in a project |
-| `export(projectId?)` | `Map<String, String>` | Export as env map |
-| `watch(secretId, callback)` | `Unit` | Watch a secret for changes |
-| `unwatch(secretId)` | `Unit` | Stop watching a secret |
-| `setPollInterval(seconds)` | `Unit` | Set poll interval (min 10s) |
-| `close()` | `Unit` | Stop all watches, shut down polling |
+- `kotlinx-serialization-json` `1.7.3` for JSON.
+- `java.net.HttpURLConnection` for HTTPS requests.
+- Java's built-in Ed25519 implementation for request signing.
+- Java's built-in AES-GCM and HMAC-SHA256 implementations for the optional cache.
 
-## Identity Resolution
-
-1. **Explicit path** - starts with `/` or contains `identity.json`
-2. **Vault ID** - looks up `~/.sikkerkey/vaults/{vaultId}/identity.json`
-3. **`SIKKERKEY_IDENTITY` env** - path to identity file
-4. **Auto-detect** - single vault on disk
-
-The `vault_` prefix is added automatically if not present. Override base directory with `SIKKERKEY_HOME`.
-
-## Retry Behavior
-
-429 and 503 responses are retried up to 3 times with exponential backoff (1s, 2s, 4s). Each retry uses a fresh timestamp and nonce. Network errors (`IOException`) are also retried.
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `SIKKERKEY_IDENTITY` | Path to `identity.json` - overrides vault lookup |
-| `SIKKERKEY_HOME` | Base config directory (default: `~/.sikkerkey`) |
-
-## Dependencies
-
-| Dependency | Version | Purpose |
-|------------|---------|---------|
-| `kotlinx-serialization-json` | >=1.7.3 | JSON parsing |
-
-Ed25519 signing uses `java.security.Signature` (JDK built-in, Java 17+). HTTP uses `java.net.HttpURLConnection`. No external HTTP client.
+No external HTTP or cryptography client is required.
 
 ## Documentation
 
-- [SDK Overview](https://docs.sikkerkey.com/docs/sdk/overview)
-- [Kotlin SDK Reference](https://docs.sikkerkey.com/docs/sdk/kotlin)
-- [Machine Authentication](https://docs.sikkerkey.com/docs/machines/signatures)
+- [SikkerKey documentation](https://docs.sikkerkey.com)
+- [SDK overview](https://docs.sikkerkey.com/docs/sdk/overview)
+- [Kotlin SDK reference](https://docs.sikkerkey.com/docs/sdk/kotlin)
+- [Machine authentication](https://docs.sikkerkey.com/docs/machines/signatures)
 
 ## License
 
-MIT - see [LICENSE](LICENSE) for details.
+The SikkerKey Kotlin/JVM SDK is available under the [MIT License](LICENSE).

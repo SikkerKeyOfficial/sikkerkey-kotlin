@@ -16,6 +16,7 @@ import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.Signature
+import java.security.interfaces.EdECPrivateKey
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.*
 
@@ -56,6 +57,13 @@ class SikkerKey private constructor(
     @Volatile private var pollThread: Thread? = null
     @Volatile private var pollIntervalMs: Long = 15_000
 
+    // Fallback cache — off until enableCache() is called. When off, a read touches no
+    // cache code and the key below is never derived.
+    private var cacheEnabled = false
+    private var cacheMaxAgeSeconds: Long? = null
+    private var cacheOnFallback: ((String, Long) -> Unit)? = null
+    @Volatile private var cacheInstance: SecretCache? = null
+
     /** The machine ID assigned during bootstrap. */
     val machineId: String get() = identity.machineId
 
@@ -69,6 +77,12 @@ class SikkerKey private constructor(
     val apiUrl: String get() = identity.apiUrl
 
     companion object {
+        // No authoritative answer reached us from the origin, so the fallback cache may
+        // serve: 502/504 (gateway), 503 (temporarily unavailable), 520-527 (the Cloudflare
+        // origin-error family), 530 (edge can't reach origin). 401/403/404/429 (authoritative)
+        // and 500/501 (origin ran and errored) are excluded.
+        private val CACHE_UNAVAILABLE_STATUSES = setOf(502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530)
+
         private fun baseDir(): String =
             System.getenv("SIKKERKEY_HOME") ?: "${System.getProperty("user.home")}/.sikkerkey"
         private fun vaultsDir(): String = "${baseDir()}/vaults"
@@ -283,6 +297,29 @@ class SikkerKey private constructor(
         }
     }
 
+    /**
+     * Enable the on-disk fallback cache and return this client (chainable):
+     *
+     *     val sk = SikkerKey().enableCache()
+     *
+     * While enabled, every secret read is written to an encrypted, identity-bound file
+     * under `~/.sikkerkey/vaults/<vault>/cache/`, and served from there when the retrieval
+     * plane is unreachable (a network failure, or a gateway/origin error like 502/504 or a
+     * Cloudflare 52x) — never when the server returns an authoritative answer (access denied,
+     * deleted, bad auth). Off by default: until called, a read never touches the cache.
+     *
+     * @param maxAge Oldest (seconds) a cached value may be to still be served during an
+     *               outage. Null for no expiry.
+     * @param onFallback Called when a value is served from the cache — for your own logging
+     *               or metrics. The SDK itself emits nothing; a fallback is otherwise transparent.
+     */
+    fun enableCache(maxAge: Long? = null, onFallback: ((String, Long) -> Unit)? = null): SikkerKey {
+        cacheEnabled = true
+        cacheMaxAgeSeconds = maxAge
+        cacheOnFallback = onFallback
+        return this
+    }
+
     // ── Read ──
 
     /**
@@ -292,8 +329,43 @@ class SikkerKey private constructor(
      * @return The decrypted secret value as a string.
      */
     fun getSecret(secretId: String): String {
-        return request("GET", "/v1/secret/$secretId").parseValue()
+        // Fast path: caching off → behave exactly as before, touching no cache code.
+        if (!cacheEnabled) return request("GET", "/v1/secret/$secretId").parseValue()
+        return try {
+            val value = request("GET", "/v1/secret/$secretId").parseValue()
+            try { getCache().store(secretId, "", value, null) } catch (_: Exception) { /* best-effort */ }
+            value
+        } catch (e: ApiException) {
+            if (isUnavailable(e)) {
+                val hit = loadFromCache(secretId)
+                if (hit != null) {
+                    // Transparent by default; the app observes fallback only via onFallback.
+                    cacheOnFallback?.invoke(secretId, hit.cachedAt)
+                    return hit.value
+                }
+            }
+            throw e
+        }
     }
+
+    private fun getCache(): SecretCache {
+        cacheInstance?.let { return it }
+        val seed = (privateKey as EdECPrivateKey).bytes.orElseThrow {
+            SikkerKeyException("Caching requires an exportable Ed25519 identity key")
+        }
+        return SecretCache(identity.vaultId, identity.machineId, SecretCache.deriveKey(seed, identity.vaultId))
+            .also { cacheInstance = it }
+    }
+
+    private fun loadFromCache(secretId: String): CacheResult? {
+        val hit = try { getCache().load(secretId) } catch (_: Exception) { return null } ?: return null
+        val maxAge = cacheMaxAgeSeconds
+        if (maxAge != null && (System.currentTimeMillis() / 1000 - hit.cachedAt) > maxAge) return null
+        return hit
+    }
+
+    private fun isUnavailable(e: ApiException): Boolean =
+        e.httpStatus == 0 || e.httpStatus in CACHE_UNAVAILABLE_STATUSES
 
     /**
      * Fetch a structured secret and return its fields as a map.
@@ -625,7 +697,7 @@ class ConflictException(message: String, httpStatus: Int = 409) : ApiException(m
 /** 429 — too many requests. */
 class RateLimitedException(message: String, httpStatus: Int = 429) : ApiException(message, httpStatus)
 
-/** 503 — server is sealed, awaiting unseal. */
+/** 503 — the service is temporarily unavailable. */
 class ServerSealedException(message: String, httpStatus: Int = 503) : ApiException(message, httpStatus)
 
 /** Tried to use getFields/getField on a non-structured secret. */

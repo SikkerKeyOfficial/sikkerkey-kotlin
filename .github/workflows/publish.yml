@@ -1,0 +1,41 @@
+name: Publish to Maven Central
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Fetch secrets and publish
+        env:
+          SIKKERKEY_VAULT_ID: ${{ secrets.SIKKERKEY_VAULT_ID }}
+          SIKKERKEY_ENROLLMENT_TOKEN: ${{ secrets.SIKKERKEY_ENROLLMENT_TOKEN }}
+          SECRET_ID: sk_ez6hpl12pf8t100d
+        run: |
+          pip install --quiet sikkerkey
+          python - <<'PY'
+          import base64, os, subprocess
+          from sikkerkey import SikkerKey
+          sk = SikkerKey.bootstrap_in_memory(
+              os.environ["SIKKERKEY_VAULT_ID"], os.environ["SIKKERKEY_ENROLLMENT_TOKEN"])
+          f = sk.get_fields(os.environ["SECRET_ID"])
+          env = {
+              **os.environ,
+              "ORG_GRADLE_PROJECT_mavenCentralUsername": f["mavenCentralUsername"],
+              "ORG_GRADLE_PROJECT_mavenCentralPassword": f["mavenCentralPassword"],
+              "ORG_GRADLE_PROJECT_signingInMemoryKeyPassword": f["signingInMemoryKeyPassword"],
+              "ORG_GRADLE_PROJECT_signingInMemoryKey": base64.b64decode(f["signingInMemoryKey"]).decode(),
+          }
+          subprocess.run(
+              ["./gradlew", "publishAndReleaseToMavenCentral", "--no-configuration-cache"],
+              env=env, check=True)
+          PY
